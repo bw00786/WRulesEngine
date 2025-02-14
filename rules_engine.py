@@ -1,5 +1,6 @@
 import logging
 import json
+import os
 from fastapi import FastAPI, HTTPException, Depends, BackgroundTasks, File, UploadFile  # Add UploadFile here
 from fastapi.middleware.cors import CORSMiddleware  # Import CORSMiddleware
 from fastapi_limiter import FastAPILimiter
@@ -19,27 +20,34 @@ import uvicorn
 from concurrent.futures import ThreadPoolExecutor
 import aioredis
 import prometheus_client
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, PydanticSchemaGenerationError
 from prometheus_client import Counter, Histogram
 from starlette.middleware.base import BaseHTTPMiddleware
 from contextlib import asynccontextmanager
 import io
 import pandas as pd  # For Excel/CSV handling
 
+
 # Initialize logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
+
+OPEN_AI_KEY=os.getenv('OPEN_AI_KEY')
+POSTGRES_URL = "postgresql+asyncpg://user:password@localhost:5432/rules_db"
+REDIS_URL = os.getenv('REDIS_URL')
+LLM_MODEL= os.getenv('LLM_MODEL')
+
 
 # Define the Base for SQLAlchemy models
 Base = declarative_base()
 
 # Database Models
 class RuleModel(Base):
-    __tablename__ = "rules3"
-    Id = Column(Integer, primary_key=True, index=True)
+    __tablename__ = "rules15"
+    id = Column(Integer, primary_key=True, index=True)  
     name = Column(String, unique=True, index=True)
-    conditions = Column(JSON)
-    actions = Column(JSON)
+    conditions = Column(JSON, nullable=True)
+    actions = Column(JSON, nullable=True)
     description = Column(String, nullable=True)
     context = Column(String, nullable=True)
     llm_config = Column(JSON, nullable=True)
@@ -47,13 +55,17 @@ class RuleModel(Base):
 # Pydantic Models
 class LLMConfig(BaseModel):
     temperature: float = Field(default=0.0, ge=0.0, le=2.0)
-    model: str = Field(default="gpt-4-turbo-preview")
+    model: str = Field(default=LLM_MODEL)
     max_tokens: int = Field(default=500)
 
 class Rule(BaseModel):
+    id: int
     name: str
     conditions: List[Dict[str, Any]]
     actions: List[Dict[str, Any]]
+    
+
+
 
 class EnhancedRule(Rule):
     description: Optional[str] = None
@@ -69,13 +81,13 @@ class Fact(BaseModel):
     facts: Dict[str, Any]
 
 # Global variables
-client = AsyncOpenAI(api_key="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")
+client = AsyncOpenAI(api_key=OPEN_AI_KEY)
 REQUEST_COUNT = Counter("http_requests_total", "Total HTTP Requests", ["method", "endpoint"])
 REQUEST_LATENCY = Histogram("http_request_duration_seconds", "HTTP request latency", ["endpoint"])
 
 # Database configuration
-DATABASE_URL = "postgresql+asyncpg://user:password@localhost:5432/rules_db"
-engine = create_async_engine(DATABASE_URL, echo=False)
+DATABASE_URL = POSTGRES_URL
+engine = create_async_engine(DATABASE_URL, echo=True)
 AsyncSessionLocal = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
 # Lifespan context manager
@@ -83,22 +95,24 @@ AsyncSessionLocal = sessionmaker(engine, class_=AsyncSession, expire_on_commit=F
 async def lifespan(app: FastAPI):
     # Startup
     redis = await aioredis.from_url(
-        "redis://localhost:6379",
+        REDIS_URL,
         encoding="utf8",
         decode_responses=True
     )
-    
+
     await FastAPILimiter.init(redis)
     FastAPICache.init(RedisBackend(redis), prefix="fastapi-cache")
-    
+
+    # ✅ Fix: Ensure database schema is created before use
     async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-    
-    yield
-    
+        await conn.run_sync(Base.metadata.create_all)  # ✅ Ensure table exists
+
+    yield  # Let FastAPI start the application
+
     # Shutdown
     await redis.close()
     await engine.dispose()
+
 
 # Initialize FastAPI app with lifespan
 app = FastAPI(lifespan=lifespan)
@@ -142,39 +156,35 @@ async def get_db():
 
 # Helper functions
 async def validate_rule_with_llm(rule: EnhancedRule) -> RuleValidationResult:
-    """Validate a rule using LLM to check for logical consistency and improvements"""
-    conditions_json = json.dumps(rule.conditions, indent=2)
-    actions_json = json.dumps(rule.actions, indent=2)
+    """Validate a rule using LLM."""
+
+    conditions_json = json.dumps(rule.conditions, indent=2, ensure_ascii=False)  # Important!
+    actions_json = json.dumps(rule.actions, indent=2, ensure_ascii=False)      # Important!
+
     prompt = f"""
     Please analyze this business rule for logical consistency and potential improvements:
-    
+    ID: {rule.id}
     Rule Name: {rule.name}
     Description: {rule.description or 'No description provided'}
     Context: {rule.context or 'No context provided'}
-    
-    Conditions: {json.dumps(rule.conditions, indent=2)}
-    Actions: {json.dumps(rule.actions, indent=2)}
-    
+
+    Conditions: {conditions_json}
+    Actions: {actions_json}
+
     Please analyze the following aspects:
     1. Logical consistency between conditions and actions
     2. Potential conflicts with common business rules
     3. Completeness of the rule
     4. Potential edge cases
     5. Suggested improvements
-    
+
     Provide your response in JSON format with the following structure:
-    {
+    {{
         "is_valid": boolean,
         "feedback": "detailed analysis",
         "suggested_improvements": ["improvement1", "improvement2", ...]
-    }
-    """ .format(
-        rule_name=rule.name,
-        description=rule.description or 'No description provided',
-        context=rule.context or 'No context provided',
-        conditions=conditions_json,
-        actions=actions_json
-    )
+    }}
+    """
 
     try:
         response = await client.chat.completions.create(
@@ -187,10 +197,8 @@ async def validate_rule_with_llm(rule: EnhancedRule) -> RuleValidationResult:
             max_tokens=rule.llm_config.max_tokens,
             response_format={"type": "json_object"}
         )
-        
-        result = json.loads(response.choices[0].message.content)
-        logger.info("LLM raw response: %s", response.choices[0].message.content)
 
+        result = json.loads(response.choices[0].message.content)
         return RuleValidationResult(**result)
     except Exception as e:
         logger.error(f"LLM validation failed: {str(e)}")
@@ -310,7 +318,7 @@ async def extract_actions_from_text(text: str, client: AsyncOpenAI) -> List[dict
     
     try:
         response = await client.chat.completions.create(
-            model="gpt-4-turbo-preview",
+            model="gpt-4o",
             temperature=0,
             messages=[
                 {"role": "system", "content": "You are a rule parser that outputs only valid JSON arrays of actions."},
@@ -329,6 +337,7 @@ async def extract_actions_from_text(text: str, client: AsyncOpenAI) -> List[dict
             
         json_str = response_text[start_idx:end_idx]
         actions = json.loads(json_str)
+        logger.info(f"this is the look of the actions from the LLM call {actions}")
         
         # Ensure we always return a list
         if isinstance(actions, dict):
@@ -343,14 +352,14 @@ async def extract_actions_from_text(text: str, client: AsyncOpenAI) -> List[dict
         raise ValueError(f"Could not parse action text: {str(e)}")
 
 async def process_excel_rules(file: UploadFile, db: AsyncSession, client: AsyncOpenAI):
-    """Process rules from Excel file containing natural language rules"""
+    """Process rules from Excel file containing natural language text."""
     try:
         logger.info("Processing natural language rules from Excel file")
         contents = await file.read()
         df = pd.read_excel(io.BytesIO(contents))
         
         # Validate required columns
-        required_columns = ['Id']
+        required_columns = ['id', 'Conditions', 'Actions']
         missing_columns = [col for col in required_columns if col not in df.columns]
         if missing_columns:
             raise HTTPException(
@@ -363,15 +372,14 @@ async def process_excel_rules(file: UploadFile, db: AsyncSession, client: AsyncO
         
         for index, row in df.iterrows():
             try:
+                # Extract and validate ID
+                # Extract and validate ID (convert to integer)
+                try:
+                    rule_id = int(row.get('id', ''))  # Convert to integer here
+                except ValueError:
+                    raise ValueError(f"Invalid ID for row {index + 1}. ID must be an integer.")
 
-                # Extract id with fallback options
-                rule_id = str(
-                    row.get('Id', '') or 
-                    row.get('id', '') or 
-                   ''
-                ).strip() or None
-
-                # Extract rule name with fallback options
+                # Extract rule name with fallback
                 rule_name = str(
                     row.get('Rule Name', '') or 
                     row.get('Name', '') or 
@@ -385,88 +393,129 @@ async def process_excel_rules(file: UploadFile, db: AsyncSession, client: AsyncO
                     ''
                 ).strip() or None
                 
-                # Process rule text
-                rule_text = str(row['Conditions']).strip()
-                if rule_text.lower() == 'nan' or not rule_text:
-                    raise ValueError("Empty rule text")
+                # Process conditions text
+                conditions_text = str(row.get('Conditions', '')).strip()
+                if not conditions_text or conditions_text.lower() == 'nan':
+                    raise ValueError(f"Empty conditions text for rule {rule_name}")
                 
-                logger.info(f"Processing rule text: {rule_text}")
-                rule_conditions = await extract_conditions_from_text(rule_text, client)
+                logger.info(f"Processing rule text: {conditions_text}")
+                rule_conditions = await extract_conditions_from_text(conditions_text, client)
+                
+                # Validate extracted conditions
+                if not rule_conditions:
+                    raise ValueError(f"Failed to extract conditions from text for rule {rule_name}")
+                
                 logger.info(f"DEBUG: Rule Extracted: {json.dumps(rule_conditions, indent=2)}")
                 
-                # Process actions if present
-                rule_actions = []
-                if 'Actions' in df.columns:
-                    actions_text = str(row['Actions']).strip()
-                    if actions_text and actions_text.lower() != 'nan':
-                        logger.info(f"Processing actions text: {actions_text}")
-                        rule_actions = await extract_actions_from_text(actions_text, client)
-                        logger.info(f"DEBUG: Actions Extracted: {json.dumps(rule_actions, indent=2)}")
+                # Process actions text
+                actions_text = str(row['Actions']).strip()
+                if actions_text.lower() == 'nan' or not actions_text:
+                    raise ValueError(f"Empty actions text for rule {rule_name}")
                 
-                # Debug logging
-                logger.info(f"Processed rule {rule_name}:")
-                logger.info("Processed rule %s: Conditions: %s Actions: %s", rule_name, json.dumps(rule_conditions), json.dumps(rule_actions))
-
-                logger.info(f"Conditions: {json.dumps(rule_conditions)}")
-                logger.info(f"Actions: {json.dumps(rule_actions)}")
+                logger.info(f"Processing actions text: {actions_text}")
+                rule_actions = await extract_actions_from_text(actions_text, client)
                 
-                # Create EnhancedRule object with safe defaults
+                # Validate extracted actions
+                if not rule_actions:
+                    raise ValueError(f"Failed to extract actions from text for rule {rule_name}")
+                
+                logger.info(f"DEBUG: Actions Extracted: {json.dumps(rule_actions, indent=2)}")
+                
+                # Create EnhancedRule object for validation
                 enhanced_rule = EnhancedRule(
-                    id = rule_id,
+                    id=rule_id,
                     name=rule_name,
                     conditions=rule_conditions,
                     actions=rule_actions,
                     description=rule_description,
                     context=str(row.get('Context', '')).strip() or None,
-                    llm_config=LLMConfig()  # Use default config
+                    llm_config=LLMConfig()
                 )
                 
                 # Validate rule with LLM
                 validation_result = await validate_rule_with_llm(enhanced_rule)
                 
                 if not validation_result.is_valid:
+                    logger.warning(f"Rule {rule_name} failed validation: {validation_result.feedback}")
                     errors.append({
-                        "row": index + 1,
-                        "rule_name": rule_name,
-                        "error": "Validation failed",
-                        "feedback": validation_result.feedback,
-                        "improvements": validation_result.suggested_improvements
+                       "row": index + 1,
+                       "rule_name": rule_name,
+                       "error": "Validation failed",
+                       "feedback": validation_result.feedback,
+                       "improvements": validation_result.suggested_improvements
                     })
-                    continue
+                    continue  # Skipping rule insertion
+                else:
+                    logger.info(f"Rule {rule_name} passed validation and will be inserted.")
+
                 
-                # Create database rule with explicit type conversion
+                # Check if rule already exists in the database
+                existing_rule = await db.execute(select(RuleModel).where(RuleModel.id == rule_id))
+                if existing_rule.scalar():
+                    logger.warning(f"Skipping duplicate rule: {rule_name} (ID: {rule_id}) already exists in the database.")
+                    continue  # Skip this rule and move to the next one
+                
+                # Create database rule with proper JSON string conversion
                 db_rule = RuleModel(
-                    id=str(enhanced_rule.id),
-                    name=str(enhanced_rule.name),
-                    conditions=[dict(cond) for cond in enhanced_rule.conditions],
-                    actions=[dict(action) for action in enhanced_rule.actions],
-                    description=enhanced_rule.description,
+                    id=rule_id,      # Now an integer
+                    name=rule_name,
+                    conditions=json.dumps(rule_conditions, ensure_ascii=False),  # Convert to JSON string
+                    actions=json.dumps(rule_actions, ensure_ascii=False),        # Convert to JSON string
+                    description=rule_description,
                     context=enhanced_rule.context,
                     llm_config=enhanced_rule.llm_config.dict() if enhanced_rule.llm_config else None
                 )
-                logger.info("Adding rules to the database")
+
+                # Add rule to database
+                logger.info(f"Adding rule to database: {rule_name}")
                 db.add(db_rule)
                 await db.commit()
                 await db.refresh(db_rule)
                 
+                try:
+                   db.add(db_rule)
+                   await db.commit()
+                   await db.refresh(db_rule)
+                   logger.info(f"Successfully inserted rule {rule_name} with ID {rule_id}")
+                except Exception as e:
+                   logger.error(f"Failed to insert rule {rule_name}: {str(e)}")
+                   await db.rollback()
+                   errors.append({"row": index + 1, "rule_name": rule_name, "error": f"Database commit failed: {str(e)}"})
+
+
+                
                 rules_added.append({
                     "name": rule_name,
-                    "original_text": rule_text,
+                    "id": rule_id, # Use the database-assigned ID
+                    "original_conditions": conditions_text,
                     "parsed_conditions": rule_conditions,
+                    "original_actions": actions_text,
                     "parsed_actions": rule_actions
                 })
                 
-            except Exception as e:
-                logger.error(f"Error processing rule {rule_name if 'rule_name' in locals() else f'Row_{index + 1}'}: {str(e)}")
+                logger.info(f"Successfully processed rule: {rule_name}")
+                
+            except ValueError as ve:
+                logger.error(f"Validation error in row {index + 1}: {str(ve)}")
                 await db.rollback()
                 errors.append({
                     "row": index + 1,
                     "rule_name": rule_name if 'rule_name' in locals() else f"Row_{index + 1}",
-                    "error": str(e)
+                    "error": str(ve)
+                })
+                continue
+                
+            except Exception as e:
+                logger.error(f"Error processing row {index + 1}: {str(e)}", exc_info=True)
+                await db.rollback()
+                errors.append({
+                    "row": index + 1,
+                    "rule_name": rule_name if 'rule_name' in locals() else f"Row_{index + 1}",
+                    "error": f"Unexpected error: {str(e)}"
                 })
                 continue
         
-        # Return detailed response
+        # Prepare response
         response = {
             "success": {
                 "count": len(rules_added),
@@ -476,7 +525,7 @@ async def process_excel_rules(file: UploadFile, db: AsyncSession, client: AsyncO
         
         if errors:
             response["errors"] = errors
-        
+            
         return response
         
     except pd.errors.EmptyDataError:
@@ -484,7 +533,7 @@ async def process_excel_rules(file: UploadFile, db: AsyncSession, client: AsyncO
     except pd.errors.ParserError as e:
         raise HTTPException(status_code=400, detail=f"Error parsing Excel file: {str(e)}")
     except Exception as e:
-        logger.error(f"Unexpected error processing Excel file: {str(e)}")
+        logger.error(f"Unexpected error processing Excel file: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {str(e)}")
 
 
@@ -532,6 +581,7 @@ async def add_rule(
     
     try:
         db_rule = RuleModel(
+            id=rule.id,
             name=rule.name,
             conditions=rule.conditions,
             actions=rule.actions,

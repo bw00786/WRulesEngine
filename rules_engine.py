@@ -1,6 +1,7 @@
 import logging
 import json
 import os
+from enum import Enum
 from fastapi import FastAPI, HTTPException, Depends, BackgroundTasks, File, UploadFile  # Add UploadFile here
 from fastapi.middleware.cors import CORSMiddleware  # Import CORSMiddleware
 from fastapi_limiter import FastAPILimiter
@@ -10,7 +11,7 @@ from fastapi_cache import FastAPICache
 from fastapi_cache.backends.redis import RedisBackend
 from fastapi_cache.decorator import cache
 from pydantic import BaseModel
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Union
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy import Column, Integer, String, JSON, select
@@ -43,13 +44,14 @@ Base = declarative_base()
 
 # Database Models
 class RuleModel(Base):
-    __tablename__ = "rules15"
-    id = Column(Integer, primary_key=True, index=True)  
+    __tablename__ = "rules18"
+    id = Column(Integer, primary_key=True, index=True)
     name = Column(String, unique=True, index=True)
+    context = Column(String, nullable=True)
     conditions = Column(JSON, nullable=True)
     actions = Column(JSON, nullable=True)
     description = Column(String, nullable=True)
-    context = Column(String, nullable=True)
+    priority = Column(Integer, default=0)
     llm_config = Column(JSON, nullable=True)
 
 # Pydantic Models
@@ -78,7 +80,86 @@ class RuleValidationResult(BaseModel):
     suggested_improvements: Optional[List[str]] = None
 
 class Fact(BaseModel):
+    context: str  # Domain context (e.g., "employee", "finance", "insurance")
     facts: Dict[str, Any]
+    metadata: Optional[Dict[str, Any]] = Field(default_factory=dict)
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "context": "finance",
+                "facts": {
+                    "age": 55,
+                    "savings": 200000,
+                    "contribution": 15000
+                },
+                "metadata": {
+                    "source": "annual_review",
+                    "timestamp": "2025-02-14T16:40:58"
+                }
+            }
+        }
+# Add these new models while keeping your existing ones
+class Operator(str, Enum):
+    EQUALS = "=="
+    NOT_EQUALS = "!="
+    GREATER_THAN = ">"
+    LESS_THAN = "<"
+    GREATER_EQUAL = ">="
+    LESS_EQUAL = "<="
+    IN = "in"
+    NOT_IN = "not_in"
+    CONTAINS = "contains"
+    NOT_CONTAINS = "not_contains"
+    EXISTS = "exists"
+    NOT_EXISTS = "not_exists"
+    MATCHES_REGEX = "matches_regex"
+
+
+class Condition(BaseModel):
+    field: str
+    operator: Operator
+    value: Optional[Any] = None
+
+    def evaluate(self, facts: Dict[str, Any]) -> bool:
+        if self.operator in [Operator.EXISTS, Operator.NOT_EXISTS]:
+            exists = self.field in facts
+            return exists if self.operator == Operator.EXISTS else not exists
+            
+        if self.field not in facts:
+            return False
+            
+        fact_value = facts[self.field]
+        
+        try:
+            if self.operator == Operator.EQUALS:
+                return fact_value == self.value
+            elif self.operator == Operator.NOT_EQUALS:
+                return fact_value != self.value
+            elif self.operator == Operator.GREATER_THAN:
+                return float(fact_value) > float(self.value)
+            elif self.operator == Operator.LESS_THAN:
+                return float(fact_value) < float(self.value)
+            elif self.operator == Operator.GREATER_EQUAL:
+                return float(fact_value) >= float(self.value)
+            elif self.operator == Operator.LESS_EQUAL:
+                return float(fact_value) <= float(self.value)
+            elif self.operator == Operator.IN:
+                return fact_value in self.value
+            elif self.operator == Operator.NOT_IN:
+                return fact_value not in self.value
+            elif self.operator == Operator.CONTAINS:
+                return self.value in fact_value
+            elif self.operator == Operator.NOT_CONTAINS:
+                return self.value not in fact_value
+            elif self.operator == Operator.MATCHES_REGEX:
+                return bool(re.match(self.value, str(fact_value)))
+        except (ValueError, TypeError):
+            logger.warning(f"Type conversion failed for {self.field}")
+            return False
+        
+        return False
+
 
 # Global variables
 client = AsyncOpenAI(api_key=OPEN_AI_KEY)
@@ -145,6 +226,110 @@ class MetricsMiddleware(BaseHTTPMiddleware):
         return response
 
 app.add_middleware(MetricsMiddleware)
+
+async def evaluate_facts(
+    fact: Fact,
+    db: AsyncSession,
+    use_llm: bool = False,
+    context_filter: Optional[str] = None
+) -> Dict[str, Any]:
+    """
+    Enhanced fact evaluation with flexible rule matching
+    """
+    try:
+        # Build query with optional context filter
+        query = select(RuleModel)
+        if context_filter:
+            query = query.where(RuleModel.context == context_filter)
+        
+        rules = (await db.execute(query)).scalars().all()
+        results = []
+
+        for rule in rules:
+            if use_llm:
+                result = await evaluate_with_llm(fact.facts, rule)
+                if result["conditions_met"]:
+                    results.append({
+                        "rule_name": rule.name,
+                        "actions": result["actions_to_take"],
+                        "confidence": result["confidence_score"],
+                        "reasoning": result["reasoning"]
+                    })
+            else:
+                # Convert stored JSON conditions to Condition objects
+                conditions = [Condition(**cond) for cond in json.loads(rule.conditions)]
+                actions = json.loads(rule.actions)
+                
+                # Evaluate all conditions
+                conditions_met = all(condition.evaluate(fact.facts) for condition in conditions)
+                
+                if conditions_met:
+                    results.append({
+                        "rule_name": rule.name,
+                        "rule_id": rule.id,
+                        "actions": actions,
+                        "priority": rule.priority
+                    })
+
+        # Sort results by priority if any matches found
+        if results:
+            results.sort(key=lambda x: x.get("priority", 0), reverse=True)
+
+        return {
+            "context": fact.context,
+            "matches_found": len(results),
+            "matching_rules": results,
+            "evaluation_method": "llm" if use_llm else "traditional",
+            "evaluated_facts": fact.facts
+        }
+
+    except Exception as e:
+        logger.error(f"Evaluation failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Evaluation failed: {str(e)}")
+
+async def evaluate_conditions(conditions: List[Dict[str, Any]], facts: Dict[str, Any]) -> bool:
+    """
+    Enhanced condition evaluation with type handling and flexible operators
+    """
+    for condition in conditions:
+        fact_value = facts.get(condition["field"])
+        if fact_value is None:
+            return False
+
+        # Convert types to match if needed
+        expected_value = condition["value"]
+        try:
+            fact_value = type(expected_value)(fact_value)
+        except (ValueError, TypeError):
+            logger.warning(f"Type conversion failed for {condition['field']}")
+            return False
+
+        # Enhanced operator handling
+        operator = condition.get("operator", "==")
+        if not await check_condition(fact_value, operator, expected_value):
+            return False
+
+    return True
+
+async def check_condition(fact_value: Any, operator: str, expected_value: Any) -> bool:
+    """
+    Flexible condition checking with multiple operator support
+    """
+    operators = {
+        "==": lambda x, y: x == y,
+        "!=": lambda x, y: x != y,
+        ">": lambda x, y: x > y,
+        "<": lambda x, y: x < y,
+        ">=": lambda x, y: x >= y,
+        "<=": lambda x, y: x <= y,
+        "in": lambda x, y: x in y,
+        "not_in": lambda x, y: x not in y,
+        "contains": lambda x, y: y in x if hasattr(x, '__contains__') else False,
+        "starts_with": lambda x, y: str(x).startswith(str(y)),
+        "ends_with": lambda x, y: str(x).endswith(str(y))
+    }
+    
+    return operators.get(operator, operators["=="])(fact_value, expected_value)
 
 # Database dependency
 async def get_db():
@@ -618,55 +803,48 @@ async def evaluate(
     fact: Fact,
     db: AsyncSession = Depends(get_db),
     use_llm: bool = False,
+    context_filter: Optional[str] = None,
     _: None = Depends(RateLimiter(times=5, seconds=60))
 ):
-    """Evaluate facts against rules with optional LLM-based evaluation"""
-    logger.info(f"Evaluating facts: {fact.facts}")
+    """
+    Evaluate facts against rules with flexible matching
+    """
+    return await evaluate_facts(fact, db, use_llm, context_filter)
+
+# Example of how to create a rule with the new structure
+async def create_rule_example(db: AsyncSession):
+    rule = RuleModel(
+        name="High Value Customer",
+        context="finance",
+        conditions=json.dumps([
+            {
+                "field": "savings",
+                "operator": Operator.GREATER_THAN,
+                "value": 100000
+            },
+            {
+                "field": "age",
+                "operator": Operator.GREATER_THAN,
+                "value": 50
+            }
+        ]),
+        actions=json.dumps([
+            {
+                "type": "notify",
+                "target": "investment_advisor",
+                "parameters": {
+                    "priority": "high",
+                    "message": "High value customer requires consultation"
+                }
+            }
+        ]),
+        priority=1
+    )
     
-    try:
-        if use_llm:
-            rules = await db.execute(select(RuleModel))
-            rules = rules.scalars().all()
-            all_results = []
-            
-            for rule in rules:
-                result = await evaluate_with_llm(fact.facts, rule)
-                if result["conditions_met"]:
-                    all_results.extend(result["actions_to_take"])
-            
-            if not all_results:
-                raise HTTPException(status_code=400, detail="No matching rules found")
-            
-            return {
-                "actions": all_results,
-                "evaluation_method": "llm"
-            }
-        else:
-            # Implement traditional forward-chaining inference
-            results = []
-            rules = await db.execute(select(RuleModel))
-            rules = rules.scalars().all()
-            
-            for rule in rules:
-                conditions_met = all(
-                    fact.facts.get(cond["field"]) == cond["value"]
-                    for cond in rule.conditions
-                )
-                if conditions_met:
-                    results.extend(rule.actions)
-            
-            if not results:
-                raise HTTPException(status_code=400, detail="No matching rules found")
-            
-            return {
-                "actions": results,
-                "evaluation_method": "traditional"
-            }
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Evaluation failed: {str(e)}")
-        raise HTTPException(status_code=500, detail="Evaluation failed")
+    db.add(rule)
+    await db.commit()
+
+
 
 @app.get("/metrics")
 async def metrics():

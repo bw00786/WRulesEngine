@@ -1,0 +1,19 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rules-engine-config
+  namespace: default
+data:
+  postgres-url: "postgresql+asyncpg://user:password@postgres-service:5432/rules_db"
+  database-user: "ruly"
+  database-host: "10.100.235.216"
+  database-port-number: "5432"  # Ensure this is a string
+  reports-table: "rules_reports"
+  rules-table: "rules_table23"
+  maximum-connection-pool-size: "50"  # Ensure this is a string
+  minimum-connection-pool-size: "50"   # Ensure this is a string
+  redis-url: "redis://rsai-redis-lb.ssnc-corp.cloud:6379"
+  llm-model: "meta-llama/Meta-Llama-3.1-8B-Instruct"
+  app-port: "31843"  # Ensure this is a string
+  primary-llm-url: "https://tarvos.ssnc-corp.cloud/v1/chat/completions"
+  

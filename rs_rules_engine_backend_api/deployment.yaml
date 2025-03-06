@@ -1,0 +1,97 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rs-rules-engine
+  namespace: default
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: rs-rules-engine
+  template:
+    metadata:
+      labels:
+        app: rs-rules-engine
+    spec:
+      imagePullSecrets:
+      - name: ghcr-secret
+      containers:
+      - name: rs-rules-engine
+        image: ghcr.io/bw00786/rs_rules_engine_backend_api:v17
+        ports:
+        - containerPort: 31843  # Updated container port
+        env:
+        - name: PRIMARY_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: claude-api-key-secret
+              key: CLAUDE_API_KEY
+        - name: POSTGRES_URL
+          valueFrom:
+            configMapKeyRef:
+              name: rules-engine-config
+              key: postgres-url
+        - name: REDIS_URL
+          valueFrom:
+            configMapKeyRef:
+              name: rules-engine-config
+              key: redis-url
+        - name: LLM_MODEL
+          valueFrom:
+            configMapKeyRef:
+              name: rules-engine-config
+              key: llm-model
+        - name: RULES_TABLE
+          valueFrom:
+            configMapKeyRef:
+              name: rules-engine-config
+              key: rules-table
+        - name: REPORTS_TABLE
+          valueFrom:
+            configMapKeyRef:
+              name: rules-engine-config
+              key: reports-table
+        - name: PRIMARY_LLM_URL
+          valueFrom:
+            configMapKeyRef:
+              name: rules-engine-config
+              key: primary-llm-url
+        - name: MAXIMUM_CONNECTION_POOL_SIZE
+          valueFrom:
+            configMapKeyRef:
+              name: rules-engine-config
+              key: maximum-connection-pool-size
+        - name: MINIMUM_CONNECTION_POOL_SIZE
+          valueFrom:
+            configMapKeyRef:
+              name: rules-engine-config
+              key: minimum-connection-pool-size
+        - name: DATABASE_PORT_NUMBER
+          valueFrom:
+            configMapKeyRef:
+              name: rules-engine-config
+              key: database-port-number
+        - name: APP_PORT
+          valueFrom:
+            configMapKeyRef:
+              name: rules-engine-config
+              key: app-port
+        resources:
+          requests:
+            cpu: "200m"
+            memory: "512Mi"
+          limits:
+            cpu: "500m"
+            memory: "1Gi"
+        livenessProbe:
+          httpGet:
+            path: /metrics
+            port: 31843  # Updated probe port
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /metrics
+            port: 31843  # Updated probe port
+          initialDelaySeconds: 15
+          periodSeconds: 5

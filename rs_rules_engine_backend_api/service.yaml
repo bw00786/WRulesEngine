@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: rs-rules-engine-service
+  namespace: default
+spec:
+  type: NodePort  # Changed to NodePort
+  ports:
+  - port: 31843  # Updated service port
+    targetPort: 31843  # Updated target port
+    nodePort: 31843  # Added nodePort
+    protocol: TCP
+    name: http
+  selector:
+    app: rs-rules-engine

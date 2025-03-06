@@ -21,7 +21,7 @@ import uvicorn
 from concurrent.futures import ThreadPoolExecutor
 import aioredis
 import prometheus_client
-from pydantic import BaseModel, Field, PydanticSchemaGenerationError
+from pydantic import BaseModel, Field
 from prometheus_client import Counter, Histogram
 from starlette.middleware.base import BaseHTTPMiddleware
 from contextlib import asynccontextmanager
@@ -34,7 +34,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 OPEN_AI_KEY=os.getenv('OPEN_AI_KEY')
-POSTGRES_URL = "postgresql+asyncpg://user:password@localhost:5432/rules_db"
+POSTGRES_URL = "postgresql+asyncpg://ruly:123d@localhost:5432/rulesdb"
 REDIS_URL = os.getenv('REDIS_URL')
 LLM_MODEL= os.getenv('LLM_MODEL')
 

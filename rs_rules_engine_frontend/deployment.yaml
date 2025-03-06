@@ -1,0 +1,42 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rules-engine-frontend
+  labels:
+    app: rules-engine-frontend
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: rules-engine-frontend
+  template:
+    metadata:
+      labels:
+        app: rules-engine-frontend
+    spec:
+      imagePullSecrets:
+      - name: ghcr-secret
+      containers:
+      - name: rules-engine-frontend
+        image: ghcr.io/bw00786/rs_rules_engine_frontend:v2
+        ports:
+        - containerPort: 31243
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "128Mi"
+          limits:
+            cpu: "500m"
+            memory: "256Mi"
+        livenessProbe:
+          httpGet:
+            path: /
+            port: 31243
+          initialDelaySeconds: 10
+          periodSeconds: 30
+        readinessProbe:
+          httpGet:
+            path: /
+            port: 31243
+          initialDelaySeconds: 5
+          periodSeconds: 10

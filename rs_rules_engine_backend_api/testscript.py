@@ -5,7 +5,7 @@ import random
 
 # Configuration
 API_URL = "http://localhost:8000/evaluate/"
-NUM_USERS = 50000000  # Number of concurrent users
+NUM_USERS = 1  # Number of concurrent users
 FACTS_LIST = [
     {"debt_to_income_ratio": 55, "credit_score": 700, "employment_status": "employed"},
     {"debt_to_income_ratio": 45, "credit_score": 650, "employment_status": "unemployed"},

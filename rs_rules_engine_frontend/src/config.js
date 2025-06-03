@@ -1,5 +1,3 @@
-const config = {
-    API_URL: process.env.REACT_APP_API_URL || 'http://0.0.0.0:8000' // fallback value if env var is not set
+export default {
+    API_URL: "http://localhost:8000"  // Update with your backend URL
 };
-
-export default config;

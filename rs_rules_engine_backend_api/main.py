@@ -50,16 +50,18 @@ DATABASE_USER = os.getenv('DATABASE_USER')
 DATABASE_PASSWORD = os.getenv('DATABASE_PASSWORD')
 DATABASE_HOST = os.getenv('DATABASE_HOST')
 DATABASE_NAME=os.getenv('DATABASE_NAME')
-APP_PORT=int(os.getenv('APP_PORT'))
+APP_PORT=8000
 
-REDIS_URL = os.getenv('REDIS_URL')
+REDIS_URL ="redis://localhost:6379"
 LLM_MODEL= os.getenv('LLM_MODEL')
 RULES_TABLE = os.getenv('RULES_TABLE')
 REPORTS_TABLE = os.getenv('REPORTS_TABLE')
 MINIMUM_CONNECTION_POOL_SIZE = int(os.getenv('MINIMUM_CONNECTION_POOL_SIZE',50))
 MAXIMUM_CONNECTION_POOL_SIZE = int(os.getenv('MAXIMUM_CONNECTION_POOL_SIZE',50))
-DATABASE_PORT_NUMBER = int(os.getenv('DATABASE_PORT_NUMBER', 5432))
-POSTGRES_URL = f"postgresql+asyncpg://{DATABASE_USER}:{DATABASE_PASSWORD}@{DATABASE_HOST}:{DATABASE_PORT_NUMBER}/{DATABASE_NAME}"
+DATABASE_PORT_NUMBER = int(os.getenv('DATABASE_PORT_NUMBER', 5433))
+#POSTGRES_URL = f"postgresql+asyncpg://{DATABASE_USER}:{DATABASE_PASSWORD}@{DATABASE_HOST}:{DATABASE_PORT_NUMBER}/{DATABASE_NAME}"
+POSTGRES_URL = "postgresql+asyncpg://user:password@localhost:5433/rules_db"
+client = AsyncOpenAI(api_key=PRIMARY_API_KEY)
 
 # Create an asyncpg connection pool
 async def create_db_pool():
@@ -98,7 +100,7 @@ class RuleModel(Base):
     priority = Column(Integer, default=0, index=True)
     llm_config = Column(JSON, nullable=True)
 
-# Pydantic Models
+# Pydantic Models 
 class LLMConfig(BaseModel):
     temperature: float = Field(default=0.0, ge=0.0, le=2.0)
     model: str = Field(default=LLM_MODEL)
@@ -469,12 +471,12 @@ async def get_db():
         finally:
             await session.close()
 
-# Helper functions
+# Helper functions - evalute using LLM
 async def validate_rule_with_llm(rule: EnhancedRule) -> RuleValidationResult:
     """Validate a rule using LLM."""
 
-    conditions_json = json.dumps(rule.conditions, indent=2, ensure_ascii=False)
-    actions_json = json.dumps(rule.actions, indent=2, ensure_ascii=False)
+    conditions_json = json.dumps(rule.conditions, indent=2, ensure_ascii=False)  # Important!
+    actions_json = json.dumps(rule.actions, indent=2, ensure_ascii=False)      # Important!
 
     prompt = f"""
     Please analyze this business rule for logical consistency and potential improvements:
@@ -499,56 +501,22 @@ async def validate_rule_with_llm(rule: EnhancedRule) -> RuleValidationResult:
         "feedback": "detailed analysis",
         "suggested_improvements": ["improvement1", "improvement2", ...]
     }}
-
-    Provide the JSON output in a consistent and predictable format to make parsing easier, be less wordy.
     """
 
     try:
-        payload = {
-            "model": LLM_MODEL,
-            "temperature": 0,
-            "messages": [
-                {"role": "system", "content": "You are a friendly assistant responsible for analyzing and validating business rules."},
+        response = await client.chat.completions.create(
+            model=rule.llm_config.model,
+            temperature=rule.llm_config.temperature,
+            messages=[
+                {"role": "system", "content": "You are a business rules analysis expert."},
                 {"role": "user", "content": prompt}
-            ]
-        }
-
-        headers = {"Content-Type": "application/json", "Authorization": f"Bearer {PRIMARY_API_KEY}"}
-        
-        # Send the request to the LLM
-        response = requests.post(
-            PRIMARY_LLM_URL,
-            json=payload,
-            headers=headers
+            ],
+            max_tokens=rule.llm_config.max_tokens,
+            response_format={"type": "json_object"}
         )
-        
-        # Check for HTTP errors
-        response.raise_for_status()
 
-        # Parse the JSON response
-        result = response.json()
-
-        # Check for the structure and existence of 'choices'
-        if 'choices' not in result or not result['choices']:
-            error_message = result.get('error', {}).get('message', 'Unknown error')
-            logger.error(f"LLM returned an error: {error_message}")
-            raise HTTPException(status_code=500, detail=f"LLM error: {error_message}")
-
-        # Extract the content from the response
-        content = result['choices'][0]['message']['content']
-        
-        # Parse the content into a JSON object
-        validation_result = json.loads(content)
-        
-        # Return the validation result as a RuleValidationResult object
-        return RuleValidationResult(**validation_result)
-    
-    except json.JSONDecodeError as e:
-        logger.error(f"LLM response JSON decode error: {e}")
-        raise HTTPException(status_code=500, detail="LLM response JSON decode error")
-    except requests.exceptions.RequestException as e:
-        logger.error(f"HTTP request failed: {str(e)}")
-        raise HTTPException(status_code=500, detail="HTTP request failed")
+        result = json.loads(response.choices[0].message.content)
+        return RuleValidationResult(**result)
     except Exception as e:
         logger.error(f"LLM validation failed: {str(e)}")
         raise HTTPException(status_code=500, detail="LLM validation failed")
@@ -572,46 +540,21 @@ async def evaluate_with_llm(facts: Dict[str, Any], rule: RuleModel) -> Dict[str,
         "actions_to_take": [actions] or null,
         "confidence_score": float between 0 and 1
     }
-
-    provide the JSON output in a consistent and predictable format to make parsing easier, be less wordy.
     """
 
     try:
-        #response = await client.chat.completions.create
-        payload = {
-            "model" : LLM_MODEL,
-            "temperature" :0,
-            "messages": [
-                {"role": "system", "content": "You are a friendly assistant responsible for analyzing and validating business rules."},
+        response = await client.chat.completions.create(
+            model="gpt-40",
+            temperature=0,
+            messages=[
+                {"role": "system", "content": "You are a precise rule evaluation engine."},
                 {"role": "user", "content": prompt}
-            ]
-        }
-        # LLM Service Configuration (replace with your actual endpoint)
-
-        headers = {"Content-Type": "application/json", "Authorization": f"Bearer {PRIMARY_API_KEY}"}
+            ],
+            response_format={"type": "json_object"}
+        )
         
-        response = requests.post(
-            PRIMARY_LLM_URL, 
-            json=payload,
-            headers=headers
-        )    
-        response.raise_for_status()  # This will raise an exception for bad HTTP status 
-        # Check for the structure and existence of 'choices'
-        result = response.json()
-        if 'choices' in result and len(result['choices']) > 0:
-                #return response.json()['choices'][0]['message']['content']
-                logger.info("Response from LLM is normal")
-                logger.info(response.json()['choices'][0]['message']['content'])
-
-        else:
-                # Log the specific error or issue with the response
-                error_message = result.get('choices', [{'message': {'content': 'Unknown error'}}])[0]['message']['content']
-                logging.error(f"LLM returned an error: {error_message}")
-                return f"LLM error: {error_message}"
-        #result = json.loads(response.choices[0].message.content)
-        #result = json.loads(response['choices'][0]['message']['content'])
-        return  response.json()['choices'][0]['message']['content']
-        
+        result = json.loads(response.choices[0].message.content)
+        return result
     except Exception as e:
         logger.error(f"LLM evaluation failed: {str(e)}")
         raise HTTPException(status_code=500, detail="LLM evaluation failed")
@@ -628,101 +571,69 @@ def validate_conditions(conditions: List[dict]) -> bool:
             return False
     return True  
 
-async def extract_actions_from_text(text: str) -> List[dict]:
-    """Convert natural language action text into structured JSON actions."""
+async def extract_actions_from_text(text: str, client: AsyncOpenAI) -> List[dict]:
+    """Convert natural language action text into structured JSON actions"""
     prompt = f"""
-    Convert this business rule action text into JSON actions. Ensure that the response contains only a single JSON object and no additional text.:
+    Convert this business rule action text into JSON actions:
     {text}
     
     Format each action with:
-    - type: the type of action (e.g., notify, update, create, delete)
-    - target: the target of the action (e.g., user, system, database)
-    - parameters: additional parameters for the action (e.g., message, priority)
-
+    - type: notify, update, create, or delete
+    - target: what the action affects
+    - parameters: additional parameters object
 
     For example:
-    "Notify the investment advisor with a high priority message"
+    "Send email to customer and update their status to premium"
     Should become:
     [
-        {{
-            "type": "notify",
-            "target": "investment_advisor",
-            "parameters": {{
-                "priority": "high",
-                "message": "High value customer requires consultation"
-            }}
-        }}
+        {{"type": "notify", "target": "customer", "parameters": {{"method": "email"}}}},
+        {{"type": "update", "target": "customer_status", "parameters": {{"value": "premium"}}}}
     ]
-    
     """
-    response_text = None  # Initialize the variable
-    actions = None  # Initialize the variable
-
+    
     try:
-        # Send request to LLM
-        payload = {
-            "model": LLM_MODEL,
-            "temperature": 0,
-            "messages": [
-                {"role": "system", "content": "You are a friendly assistant responsible for analyzing and validating business rules."},
+        response = await client.chat.completions.create(
+            model="gpt-4o",
+            temperature=0,
+            messages=[
+                {"role": "system", "content": "You are a rule parser that outputs only valid JSON arrays of actions."},
                 {"role": "user", "content": prompt}
             ]
-        }
-
-        headers = {"Content-Type": "application/json", "Authorization": f"Bearer {PRIMARY_API_KEY}"}
-        response = requests.post(PRIMARY_LLM_URL, json=payload, headers=headers)
-        response.raise_for_status()  # Raise exception for bad HTTP status
-
-        result = response.json()
-
-        # Check for the structure and existence of 'choices'
-        if 'choices' not in result or not result['choices']:
-            raise ValueError("LLM response is missing 'choices' field or it is empty")
-
-        # Extract the response text
-        response_text = result['choices'][0]['message']['content']
-        logger.info(f"LLM Response: {response_text}")
-
-        if not response_text:
-            raise ValueError("LLM response is empty or invalid")
-
-        # Extract JSON from the response text
-        json_match = re.search(r'(\[.*\]|\{.*\})', response_text, re.DOTALL)
-        if not json_match:
+        )
+        
+        # Extract JSON array from the response
+        response_text = response.choices[0].message.content
+        # Find the first [ and last ] to extract just the JSON array
+        start_idx = response_text.find('[')
+        end_idx = response_text.rfind(']') + 1
+        
+        if start_idx == -1 or end_idx == 0:
             raise ValueError("No JSON array found in response")
-
-        json_str = json_match.group(0)
-        logger.info(f"Extracted JSON: {json_str}")
-
-        # Parse JSON
+            
+        json_str = response_text[start_idx:end_idx]
         actions = json.loads(json_str)
-        if not actions:
-            raise ValueError("Actions string is empty or invalid")
-
+        logger.info(f"this is the look of the actions from the LLM call {actions}")
+        
         # Ensure we always return a list
         if isinstance(actions, dict):
             actions = [actions]
-
-        logger.info(f"Parsed Actions: {actions}")
+        
         return actions
-
-    except requests.exceptions.RequestException as e:
-        logger.error(f"HTTP request failed: {str(e)}")
-        raise ValueError(f"HTTP request failed: {str(e)}")
     except json.JSONDecodeError as e:
         logger.error(f"JSON parsing error: {str(e)}\nResponse: {response_text}")
         raise ValueError(f"Could not parse LLM response into valid JSON: {str(e)}")
     except Exception as e:
         logger.error(f"Failed to parse action text: {str(e)}")
-        raise ValueError(f"Could not parse action text: {str(e)}")    
+        raise ValueError(f"Could not parse action text: {str(e)}")
 
         
-async def extract_conditions_from_text(text: str) -> List[dict]:
+async def extract_conditions_from_text(text: str, rule: EnhancedRule, client: AsyncOpenAI) -> List[dict]:
+    """Convert natural language rule text into structured JSON conditions"""
     """Convert natural language rule text into structured JSON conditions"""
     prompt = f"""
-    Convert this business rule text into JSON conditions. Ensure that the response contains only a single JSON object and no additional text:
+    Convert this business rule text into JSON conditions:
     {text}
-
+    
     Format each condition with:
     - field: what is being checked
     - operator: ==, !=, >, <, >=, <=, in, not_in, contains, starts_with, ends_with
@@ -735,67 +646,40 @@ async def extract_conditions_from_text(text: str) -> List[dict]:
         {{"field": "customer_age", "operator": ">", "value": 25}},
         {{"field": "total_purchase", "operator": ">=", "value": 100}}
     ]
-
-    Ensure the response is a JSON array of conditions, with each condition containing the required fields: field, operator, and value.
     """
-    response_text = None  # Initialize the variable
-    conditions = None  # Initialize the variable
-
+    
+    
     try:
-        # Send request to LLM
-        payload = {
-            "model": LLM_MODEL,
-            "temperature": 0,
-            "messages": [
-                {"role": "system", "content": "You are a friendly assistant responsible for analyzing and validating business rules."},
+        response = await client.chat.completions.create(
+            model=rule.llm_config.model,
+            temperature=rule.llm_config.temperature,
+            messages=[
+                {"role": "system", "content": "You are a business rules analysis expert."},
                 {"role": "user", "content": prompt}
-            ]
-        }
+            ],
+            max_tokens=rule.llm_config.max_tokens,
+            response_format={"type": "json_object"}
+        )
 
-        headers = {"Content-Type": "application/json", "Authorization": f"Bearer {PRIMARY_API_KEY}"}
-        response = requests.post(PRIMARY_LLM_URL, json=payload, headers=headers)
-        response.raise_for_status()  # Raise exception for bad HTTP status
-
-        result = response.json()
-
-        # Check for the structure and existence of 'choices'
-        if 'choices' not in result or not result['choices']:
-            raise ValueError("LLM response is missing 'choices' field or it is empty")
-
-        # Extract the response text
-        response_text = result['choices'][0]['message']['content']
-        logger.info(f"LLM Response: {response_text}")
-
-        if not response_text:
-            raise ValueError("LLM response is empty or invalid")
-
-        # Extract JSON from the response text
-        json_match = re.search(r'(\[.*\]|\{.*\})', response_text, re.DOTALL)
-        if not json_match:
+         
+        
+        # Extract JSON array from the response
+        response_text = response.choices[0].message.content
+        # Find the first [ and last ] to extract just the JSON array
+        start_idx = response_text.find('[')
+        end_idx = response_text.rfind(']') + 1
+        
+        if start_idx == -1 or end_idx == 0:
             raise ValueError("No JSON array found in response")
-
-        json_str = json_match.group(0)
-        logger.info(f"Extracted JSON: {json_str}")
-
-        # Parse JSON
+            
+        json_str = response_text[start_idx:end_idx]
         conditions = json.loads(json_str)
-        if not conditions:
-            raise ValueError("Conditions string is empty or invalid")
-
+        
         # Ensure we always return a list
         if isinstance(conditions, dict):
             conditions = [conditions]
-
-        # Validate conditions
-        if not validate_conditions(conditions):
-            raise ValueError("Invalid condition structure")
-
-        logger.info(f"Parsed Conditions: {conditions}")
+        
         return conditions
-
-    except requests.exceptions.RequestException as e:
-        logger.error(f"HTTP request failed: {str(e)}")
-        raise ValueError(f"HTTP request failed: {str(e)}")
     except json.JSONDecodeError as e:
         logger.error(f"JSON parsing error: {str(e)}\nResponse: {response_text}")
         raise ValueError(f"Could not parse LLM response into valid JSON: {str(e)}")
@@ -805,7 +689,7 @@ async def extract_conditions_from_text(text: str) -> List[dict]:
 
 
 
-async def process_excel_rules(file: UploadFile, db: AsyncSession):
+async def process_excel_rules(file: UploadFile, db: AsyncSession, client: AsyncOpenAI):
     """Process rules from Excel file containing natural language text."""
     try:
         logger.info("Processing natural language rules from Excel file")
@@ -854,7 +738,7 @@ async def process_excel_rules(file: UploadFile, db: AsyncSession):
                     raise ValueError(f"Empty conditions text for rule {rule_name}")
                 
                 logger.info(f"Processing rule text: {conditions_text}")
-                rule_conditions = await extract_conditions_from_text(conditions_text)
+                rule_conditions = await extract_conditions_from_text(conditions_text, client)
                 
                 # Validate extracted conditions
                 if not rule_conditions:
@@ -993,22 +877,124 @@ async def process_excel_rules(file: UploadFile, db: AsyncSession):
 
 
 # Endpoints (modified)
-@app.post("/rules/upload/", response_model=Dict[str, Any])
-async def upload_rules(
-    background_tasks: BackgroundTasks,  # No default value, so it comes first
-    file: UploadFile = File(...),       # Default value, comes after
-    db: AsyncSession = Depends(get_db)  # Default value, comes after
+
+# Endpoint to create a rule via JSON payload
+@app.post("/rules/create/", response_model=Dict[str, str])
+async def create_rule(
+    rule: EnhancedRule,
+    db: AsyncSession = Depends(get_db)
 ):
-     """Upload rules from an Excel file with natural language text."""
-     try:
-        # Offload the task to a thread using asyncio.to_thread
-        await asyncio.to_thread(process_excel_rules, file, db)
-        return {"message": "File upload processing started"}
-     except HTTPException as e:
-        raise
-     except Exception as e:
-        logger.error(f"Error during file upload: {e}")
-        raise HTTPException(status_code=500, detail=f"An unexpected error occurred during file upload: {str(e)}")
+    """Create a new rule via JSON payload."""
+    try:
+        # Validate the rule using LLM
+        validation_result = await validate_rule_with_llm(rule)
+        if not validation_result.is_valid:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "message": "Rule validation failed",
+                    "feedback": validation_result.feedback,
+                    "improvements": validation_result.suggested_improvements
+                }
+            )
+
+        # Save the rule to the database
+        db_rule = RuleModel(
+            id=rule.id,
+            name=rule.name,
+            conditions=json.dumps(rule.conditions),
+            actions=json.dumps(rule.actions),
+            description=rule.description,
+            context=rule.context,
+            llm_config=rule.llm_config.dict() if rule.llm_config else None
+        )
+        db.add(db_rule)
+        await db.commit()
+        await db.refresh(db_rule)
+        logger.info(f"Rule {rule.name} created successfully")
+        return {"message": "Rule created successfully"}
+    except Exception as e:
+        await db.rollback()
+        logger.error(f"Failed to create rule: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to create rule")
+
+# Endpoint to upload rules from an Excel file
+@app.post("/upload_rules/", response_model=Dict[str, Any])
+async def upload_rules(
+    file: UploadFile = File(...),
+    db: AsyncSession = Depends(get_db)
+):
+    """Upload rules from an Excel file."""
+    try:
+        # Read the Excel file
+        contents = await file.read()
+        df = pd.read_excel(io.BytesIO(contents))
+
+        # Process and save rules
+        rules_added = []
+        errors = []
+        for index, row in df.iterrows():
+            try:
+                # Extract and validate rule data
+                rule_id = int(row.get("id"))
+                rule_name = str(row.get("name"))
+                conditions = json.loads(row.get("conditions"))
+                actions = json.loads(row.get("actions"))
+
+                # Create and validate the rule
+                rule = EnhancedRule(
+                    id=rule_id,
+                    name=rule_name,
+                    conditions=conditions,
+                    actions=actions,
+                    description=row.get("description"),
+                    context=row.get("context"),
+                    llm_config=LLMConfig()
+                )
+                validation_result = await validate_rule_with_llm(rule)
+                if not validation_result.is_valid:
+                    errors.append({
+                        "row": index + 1,
+                        "rule_name": rule_name,
+                        "error": "Validation failed",
+                        "feedback": validation_result.feedback
+                    })
+                    continue
+
+                # Save the rule to the database
+                db_rule = RuleModel(
+                    id=rule_id,
+                    name=rule_name,
+                    conditions=json.dumps(conditions),
+                    actions=json.dumps(actions),
+                    description=rule.description,
+                    context=rule.context,
+                    llm_config=rule.llm_config.dict() if rule.llm_config else None
+                )
+                db.add(db_rule)
+                await db.commit()
+                rules_added.append(rule_name)
+
+            except Exception as e:
+                await db.rollback()
+                errors.append({
+                    "row": index + 1,
+                    "rule_name": rule_name,
+                    "error": str(e)
+                })
+
+        return {
+            "success": {
+                "count": len(rules_added),
+                "rules": rules_added
+            },
+            "errors": errors
+        }
+
+    except Exception as e:
+        logger.error(f"Error processing Excel file: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error processing Excel file: {str(e)}")
+
 
 # Endpoints
 @app.post("/rules/validate/")
@@ -1082,7 +1068,7 @@ async def create_upload_report(
     
     try:
         # Process the rules upload
-        upload_result = await process_excel_rules(file, db)
+        upload_result = await process_excel_rules(file, db, client)
         
         # Calculate processing time
         processing_time = (datetime.now() - start_time).total_seconds()
@@ -1752,7 +1738,7 @@ async def apply_resolution_strategy(rules: List[Dict], strategy: ResolutionStrat
     
     return rules
 
-async def resolve_with_llm(rules: List[Dict]) -> List[Dict]:
+async def resolve_with_llm(rules: List[Dict], client: AsyncOpenAI) -> List[Dict]:
     """
     Use LLM to resolve complex rule conflicts.
     """
@@ -1783,25 +1769,19 @@ async def resolve_with_llm(rules: List[Dict]) -> List[Dict]:
         provide the JSON output in a consistent and predictable format to make parsing easier, be less wordy.
         """
         
-        payload = {
-            "model" : LLM_MODEL,
-            "temperature" :0,
-            "messages": [
-                {"role": "system", "content": "You are a friendly assistant responsible for analyzing and validating business rules."},
+        response = await client.chat.completions.create(
+            model="gpt-40",
+            temperature=0,
+            messages=[
+                {"role": "system", "content": "You are a rule parser that outputs only valid JSON arrays of conditions."},
                 {"role": "user", "content": prompt}
             ]
-        }
-        # LLM Service Configuration (replace with your actual endpoint)
-
-        headers = {"Content-Type": "application/json", "Authorization": f"Bearer {PRIMARY_API_KEY}"}
+        )
         
-        response = requests.post(
-            PRIMARY_LLM_URL,
-            json=payload,
-            headers=headers
-        )    
+        # Extract JSON array from the response
+        response_text = response.choices[0].message.content
         response.raise_for_status()  # This will raise an exception for bad HTTP status 
-        result = response.json()
+      
         # Check for the structure and existence of 'choices'
         if 'choices' in result and len(result['choices']) > 0:
                 logger.info("LLM communixation was successful")
@@ -1809,14 +1789,14 @@ async def resolve_with_llm(rules: List[Dict]) -> List[Dict]:
 
         else:
                 # Log the specific error or issue with the response
-                error_message = result.get('choices', [{'message': {'content': 'Unknown error'}}])[0]['message']['content']
+                error_message = response_text.get('choices', [{'message': {'content': 'Unknown error'}}])[0]['message']['content']
                 logging.error(f"LLM returned an error: {error_message}")
                 #return f"LLM error: {error_message}"
 
 
         
-        #result = json.loads(response.choices[0].message.content)
-        result = response.json()['choices'][0]['message']['content']
+        result = json.loads(response.choices[0].message.content)
+        
         selected_ids = result.get("selected_rule_ids", [])
         
         # Reorder rules based on LLM selection
